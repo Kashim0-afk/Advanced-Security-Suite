@@ -109,6 +109,14 @@ Contributi sono benvenuti! Invia una pull request o apri un problema per suggeri
 
 ---
 
+**English:**
+*This project was developed with the assistance of artificial intelligence for error checking, corrections, and certain implementations, ensuring efficiency and reliability.*
+
+**Italiano:**
+*Questo progetto è stato sviluppato con il supporto dell'intelligenza artificiale per la verifica degli errori, le correzioni e alcune implementazioni, garantendo efficienza e affidabilità.*
+
+---
+
 ## License (English & Italiano)
 This project is released under the MIT License. See the LICENSE file for more details.
 
