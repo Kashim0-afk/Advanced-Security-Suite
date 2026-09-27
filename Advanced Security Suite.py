@@ -4957,16 +4957,26 @@ class NetworkMonitor(BaseModule):
                 continue
         
         print("\nCalibrazione completata")
-        
-        # Calcola statistiche baseline
+
+        # Calcola statistiche baseline in modo robusto:
+        # mean richiede >=1 campione, stdev >=2. Con calibrazioni brevi (o errori
+        # nel loop) i campioni possono essere 0 o 1: in quel caso evitiamo il crash.
+        def _mean(key):
+            vals = [s[key] for s in samples]
+            return statistics.mean(vals) if vals else 0.0
+
+        def _stdev(key):
+            vals = [s[key] for s in samples]
+            return statistics.stdev(vals) if len(vals) >= 2 else 0.0
+
         with self.lock:
             self.baseline = {
-                'bytes_sent_mean': statistics.mean(s['bytes_sent'] for s in samples),
-                'bytes_recv_mean': statistics.mean(s['bytes_recv'] for s in samples),
-                'bytes_sent_stdev': statistics.stdev(s['bytes_sent'] for s in samples),
-                'bytes_recv_stdev': statistics.stdev(s['bytes_recv'] for s in samples),
-                'packets_sent_mean': statistics.mean(s['packets_sent'] for s in samples),
-                'packets_recv_mean': statistics.mean(s['packets_recv'] for s in samples)
+                'bytes_sent_mean': _mean('bytes_sent'),
+                'bytes_recv_mean': _mean('bytes_recv'),
+                'bytes_sent_stdev': _stdev('bytes_sent'),
+                'bytes_recv_stdev': _stdev('bytes_recv'),
+                'packets_sent_mean': _mean('packets_sent'),
+                'packets_recv_mean': _mean('packets_recv')
             }
 
     def _monitor_connections(self) -> None:
