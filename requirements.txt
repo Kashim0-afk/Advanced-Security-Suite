@@ -1,4 +1,5 @@
 requests>=2.31
 psutil>=5.9
-paramiko>=3.4
-scapy>=2.5
+# scapy è opzionale: serve solo alla scansione ICMP di rete (menu Network Scanner
+# > Scansione rete). Su Windows richiede Npcap, su Linux privilegi di root.
+scapy>=2.5 ; platform_system != ""

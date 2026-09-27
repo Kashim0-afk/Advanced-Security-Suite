@@ -25,12 +25,10 @@ from logging.handlers import RotatingFileHandler
 import socket
 import ssl
 import requests
-import paramiko
 import psutil
 import ipaddress
 
 # Librerie di crittografia e sicurezza
-import hashlib
 import secrets
 import random
 import string
@@ -41,7 +39,8 @@ from typing import Callable, Dict, List, Optional, Tuple, Union, Set  # Aggiungi
 import re
 from urllib.parse import urlparse
 import time
-from scapy.all import sr1, IP, ICMP
+# scapy viene importato in modo lazy dentro scan_network(): è pesante e
+# richiede libpcap/privilegi, quindi non deve bloccare l'avvio del resto del tool.
 
 # Costanti globali
 DEBUG_MODE = False  # Abilita/disabilita output di debug
@@ -1115,7 +1114,17 @@ class PasswordChecker(BaseModule):
                 feedback.append({"type": "danger", "message": "Nessun carattere speciale presente"})
 
             # 3. Controllo pattern pericolosi
+            # Alcuni pattern descrivono una composizione NORMALE (una lettera
+            # vicino a una cifra, lettera-simbolo-cifra, la fine con un simbolo):
+            # sono desiderabili in una password forte, non debolezze. Non vanno
+            # penalizzati, altrimenti lo strumento boccia password robuste.
+            benign_patterns = {
+                'letter_number', 'mixed_symbols', 'common_endings',
+                'symbol_sequences',
+            }
             for pattern_name, pattern in self.patterns.items():
+                if pattern_name in benign_patterns:
+                    continue
                 if re.search(pattern, password):
                     score = max(0, score - 2)  # Penalità significativa
                     weak_patterns_found.append({
@@ -1142,6 +1151,9 @@ class PasswordChecker(BaseModule):
             entropy = len(password) * math.log2(char_set_size) if char_set_size > 0 else 0
 
             # 6. Livello di forza
+            # Il punteggio grezzo può superare 10 (composizione ricca): lo
+            # limitiamo a 0-10 così il valore mostrato "/10" è coerente.
+            score = min(max(score, 0), 10)
             strength_levels = ["Molto debole", "Debole", "Media", "Forte", "Molto forte"]
             strength_index = min(max(int(score / 2), 0), len(strength_levels) - 1)
 
@@ -1898,6 +1910,13 @@ class PortScanner(BaseModule):
 
     async def scan_network(self, network: str) -> List[Dict]:
         """Esegue una scansione della rete locale con ICMP (Scapy)"""
+        try:
+            from scapy.all import sr1, IP, ICMP
+        except ImportError:
+            print_colored(
+                "scapy non è installato: la scansione ICMP di rete non è disponibile. "
+                "Installa con 'pip install scapy'.", Colors.WARNING)
+            return []
         print_colored(f"\n🔍 Avvio scansione su {network}...", Colors.INFO)
         results = []
 
@@ -2888,23 +2907,20 @@ class PortScanner(BaseModule):
             
         Returns:
             True se la versione corrente è vulnerabile
+
+        Nota: euristica grossolana. Segnala una versione come vulnerabile solo
+        se è pari o inferiore all'ultima versione nota vulnerabile, così da NON
+        marcare versioni più recenti già patchate (il vecchio comportamento le
+        segnalava per errore). Non sostituisce un controllo su range CVE reali.
         """
         try:
-            current_parts = [int(x) for x in current.split('.')]
-            vulnerable_parts = [int(x) for x in vulnerable.split('.')]
-            
-            for i in range(max(len(current_parts), len(vulnerable_parts))):
-                current_part = current_parts[i] if i < len(current_parts) else 0
-                vulnerable_part = vulnerable_parts[i] if i < len(vulnerable_parts) else 0
-                
-                if current_part < vulnerable_part:
-                    return False
-                elif current_part > vulnerable_part:
-                    return True
-                    
-            return True  # Versioni uguali
-            
-        except:
+            # re.findall gestisce suffissi tipo "7.2p1" -> [7, 2, 1]
+            current_parts = [int(x) for x in re.findall(r'\d+', current)]
+            vulnerable_parts = [int(x) for x in re.findall(r'\d+', vulnerable)]
+            if not current_parts or not vulnerable_parts:
+                return False
+            return current_parts <= vulnerable_parts
+        except (ValueError, TypeError):
             return False  # In caso di errore, assumiamo non vulnerabile
    
     def analyze_traffic_pattern(self, target_ip: str, duration: int = 10) -> Dict:
@@ -3162,7 +3178,7 @@ class PortScanner(BaseModule):
             'SSH': r'SSH-2.0-([^\r\n]+)',
             'FTP': r'^220[\s-]([^\r\n]+)',
             'SMTP': r'^220[\s-]([^\r\n]+)',
-            'POP3': r'^+OK[\s-]([^\r\n]+)',
+            'POP3': r'^\+OK[\s-]([^\r\n]+)',
             'IMAP': r'^\* OK[\s-]([^\r\n]+)'
         }
         
@@ -4062,7 +4078,7 @@ class WebSecurityTester(BaseModule):
                             'details': f"Database error detected: {pattern['pattern']}"
                         })
 
-                    if response_time > (baseline_time * 5) and 'time_based' in category:
+                    if response_time > (baseline_time * 5) and 'blind_time' in category:
                         vulnerabilities.append({
                             'type': 'time_based',
                             'payload': payload,
@@ -4661,13 +4677,9 @@ def web_security_menu():
             print("\nOpzione non valida!")
 
 
-if __name__ == "__main__":
-    try:
-        MenuManager()
-    except KeyboardInterrupt:
-        print("\nOperazione interrotta dall'utente.")
-    except Exception as e:
-        print(f"\nErrore: {str(e)}")
+# Nota: l'avvio reale del programma è in fondo al file, tramite main().
+# Il precedente blocco __main__ qui costruiva un MenuManager inutilizzato
+# (prima ancora che tutte le classi fossero definite) ed è stato rimosso.
 
 
 
@@ -5554,9 +5566,20 @@ def cleanup() -> None:
         ExceptionHandler.handle_exception(e, "cleanup")
 
 
+DISCLAIMER = (
+    "ATTENZIONE / WARNING\n"
+    "Usa questo strumento SOLO su sistemi di tua proprietà o per cui hai\n"
+    "un'autorizzazione scritta. La scansione o il test non autorizzati di\n"
+    "sistemi altrui possono costituire reato (in Italia, es. art. 615-ter c.p.).\n"
+    "L'autore non è responsabile di usi impropri.\n"
+    "Use this tool ONLY on systems you own or are authorized in writing to test.\n"
+)
+
+
 def main():
     try:
         print_banner()
+        print_colored(DISCLAIMER, Colors.WARNING)
         init_config()  # Aggiunto init_config() per inizializzare la configurazione
         menu_manager = MenuManager()
         menu_manager.show_main_menu()
@@ -5570,22 +5593,4 @@ def main():
         cleanup()
 
 if __name__ == "__main__":
-    try:
-        # Stampa il banner del programma
-        print_banner()
-
-        # Inizializza il gestore del menu
-        menu_manager = MenuManager()
-
-        # Mostra il menu principale
-        menu_manager.show_main_menu()
-
-    except KeyboardInterrupt:
-        # Gestione dell'interruzione da tastiera (Ctrl + C)
-        print("\nProgramma interrotto manualmente.")
-        sys.exit(0)
-
-    except Exception as e:
-        # Gestione di eventuali errori
-        ExceptionHandler.handle_exception(e, "Programma principale")
-        sys.exit(1)
+    main()
