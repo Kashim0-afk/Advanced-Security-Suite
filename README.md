@@ -17,10 +17,10 @@ Interactive Python CLI built as a learning project during the *Junior System and
 
 This is a learning project, not a professional scanner:
 
-- SQLi/XSS detection is heuristic and produces false positives and false negatives. Use dedicated tools (OWASP ZAP, Burp Suite, sqlmap) for real assessments.
+- SQLi/XSS detection is **per-parameter and differential**: it injects one parameter at a time and reports one finding per vulnerable parameter (with the count of confirming payloads), not one per payload. Error-based SQLi is flagged only when a DB error appears with the payload but not in the clean baseline request; reflected XSS only when the payload is reflected **unescaped** (an app that HTML-encodes output is correctly not flagged). It still does not cover boolean-blind SQLi or DOM-based XSS and does not crawl — use OWASP ZAP, Burp Suite or sqlmap for real assessments.
 - Some scan modes (`fast`, `smart`, `adaptive`, `specific service`) return simulated placeholder data.
 - The file contains unused code paths that are being cleaned up.
-- No automated tests yet.
+- No automated test suite yet (the detection was validated manually against controlled local apps and the authorized target scanme.nmap.org).
 
 ## Installation
 

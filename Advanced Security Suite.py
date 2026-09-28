@@ -4001,12 +4001,21 @@ class WebSecurityTester(BaseModule):
         
         return list(unique_vulnerabilities.values())
 
-    def test_sql_injection(self, url: str, params: Optional[Dict] = None,  
-                      method: str = 'GET', data: Optional[Dict] = None,
-                      custom_payloads: Optional[List[str]] = None,
-                      scan_level: str = 'normal') -> Dict:
-        """Versione migliorata del test SQL injection"""
+    def test_sql_injection(self, url: str, params: Optional[Dict] = None,
+                           method: str = 'GET', data: Optional[Dict] = None,
+                           custom_payloads: Optional[List[str]] = None,
+                           scan_level: str = 'normal') -> Dict:
+        """Test SQL injection affidabile e per-parametro.
 
+        Regole per evitare falsi positivi e conteggi gonfiati:
+        - inietta UN parametro alla volta (così si sa quale è vulnerabile);
+        - error-based confermato solo se l'errore DB compare col payload ma NON
+          nella richiesta pulita (confronto differenziale con la baseline);
+        - time-based confermato solo se la risposta è lenta due volte di fila
+          e ben oltre la baseline (soglia relativa e assoluta);
+        - una sola voce per (parametro, tecnica), con l'elenco dei payload che
+          l'hanno confermata. Niente content-based euristico (troppo rumoroso).
+        """
         if not url.startswith(('http://', 'https://')):
             raise ValueError("URL must start with http:// or https://")
 
@@ -4014,119 +4023,118 @@ class WebSecurityTester(BaseModule):
         if self._is_rate_limited(target):
             raise RateLimitExceeded(f"Rate limit exceeded for {target}")
 
+        base_params = dict(params or {})
+        base_data = dict(data or {})
+        inject_into = base_params if method.upper() == 'GET' else base_data
+        target_params = list(inject_into.keys())
+
+        all_payloads = [(p, c) for c, p_list in self.sql_payloads.items() for p in p_list]
+        if custom_payloads:
+            all_payloads.extend([(p, 'custom') for p in custom_payloads])
+
+        if not target_params:
+            return {
+                'url_tested': url,
+                'note': "Nessun parametro da testare: passa params (GET) o data (POST).",
+                'total_tests': 0,
+                'vulnerabilities_found': 0,
+                'vulnerabilities': [],
+                'recommendations': [],
+            }
+
         vulnerabilities = []
-        test_results = defaultdict(list)
         error_messages = set()
+        total_tests = 0
 
         with requests.Session() as session:
             session.headers.update(self.headers)
             session.verify = self.verify_ssl
 
-            all_payloads = [(p, c) for c, p_list in self.sql_payloads.items() for p in p_list]
-            if custom_payloads:
-                all_payloads.extend([(p, 'custom') for p in custom_payloads])
-
-            total_tests = len(all_payloads)
-
+            # Baseline: richiesta con i valori originali, per sapere quali errori
+            # sono GIA' presenti nella pagina (e quindi non provano nulla).
             try:
-                baseline_params, baseline_data = self._prepare_request_params("dummy", params, data, method)
-                baseline_response = session.request(
-                    method=method.upper(),
-                    url=url,
-                    params=baseline_params,
-                    data=baseline_data,
-                    timeout=self.timeout
-                )
-                baseline_length = len(baseline_response.text)
-                baseline_time = baseline_response.elapsed.total_seconds()
+                b = session.request(method=method.upper(), url=url,
+                                    params=base_params if method.upper() == 'GET' else None,
+                                    data=base_data if method.upper() != 'GET' else None,
+                                    timeout=self.timeout)
+                baseline_text = b.text.lower()
+                baseline_time = b.elapsed.total_seconds()
+                baseline_db = {p['database'] for p in self._analyze_response_patterns(baseline_text, "")}
             except Exception as e:
-                self._log_error(f"Error during baseline request: {str(e)}")
-                return {'error': str(e)}
+                return {'error': f"baseline request failed: {e}", 'url_tested': url}
 
-            for index, (payload, category) in enumerate(all_payloads, 1):
-                try:
-                    test_params, test_data = self._prepare_request_params(payload, params, data, method)
-                
-                    for attempt in range(3):  # 3 tentativi
-                        try:
-                            response = session.request(
-                                method=method.upper(),
-                                url=url,
-                                params=test_params,
-                                data=test_data,
-                                timeout=self.timeout
-                            )
-                            break
-                        except requests.RequestException as e:
-                            self._log_warning(f"Tentativo {attempt + 1}/3 fallito con payload '{payload}': {str(e)}")
-                            if attempt == 2:
-                                raise
-                            time.sleep(1)
+            for param in target_params:
+                err_payloads = []
+                err_dbs = set()
+                time_payloads = []
+                for payload, category in all_payloads:
+                    total_tests += 1
+                    req_params = dict(base_params)
+                    req_data = dict(base_data)
+                    (req_params if method.upper() == 'GET' else req_data)[param] = payload
+                    try:
+                        r = session.request(method=method.upper(), url=url,
+                                            params=req_params if method.upper() == 'GET' else None,
+                                            data=req_data if method.upper() != 'GET' else None,
+                                            timeout=self.timeout)
+                    except requests.RequestException as e:
+                        self._log_warning(f"{param} payload '{payload}': {e}")
+                        continue
 
-                    response_text = response.text.lower()
-                    response_time = response.elapsed.total_seconds()
+                    text = r.text.lower()
+                    # error-based differenziale: DB error nuovo rispetto alla baseline
+                    for pat in self._analyze_response_patterns(text, payload):
+                        if pat['database'] not in baseline_db:
+                            err_payloads.append(payload)
+                            err_dbs.add(pat['database'])
+                            error_messages.add(pat['pattern'])
 
-                    db_patterns = self._analyze_response_patterns(response_text, payload)
-                    for pattern in db_patterns:
-                        vulnerabilities.append({
-                            'type': 'error_based',
-                            'payload': payload,
-                            'category': category,
-                            'database': pattern['database'],
-                            'pattern': pattern['pattern'],
-                            'confidence': pattern['confidence'],
-                            'details': f"Database error detected: {pattern['pattern']}"
-                        })
+                    # time-based: solo categoria blind_time, lento e riconfermato
+                    if 'blind_time' in category:
+                        rt = r.elapsed.total_seconds()
+                        if rt > max(baseline_time * 5, baseline_time + 3):
+                            try:
+                                r2 = session.request(method=method.upper(), url=url,
+                                                     params=req_params if method.upper() == 'GET' else None,
+                                                     data=req_data if method.upper() != 'GET' else None,
+                                                     timeout=self.timeout)
+                                if r2.elapsed.total_seconds() > max(baseline_time * 5, baseline_time + 3):
+                                    time_payloads.append(payload)
+                            except requests.RequestException:
+                                pass
 
-                    if response_time > (baseline_time * 5) and 'blind_time' in category:
-                        vulnerabilities.append({
-                            'type': 'time_based',
-                            'payload': payload,
-                            'category': category,
-                            'response_time': response_time,
-                            'baseline_time': baseline_time,
-                            'confidence': 0.8,
-                            'details': f"Time-based SQL injection possible (response: {response_time}s, baseline: {baseline_time}s)"
-                        })
-
-                    content_diff = abs(len(response.text) - baseline_length)
-                    if content_diff > 500:
-                        vulnerabilities.append({
-                            'type': 'content_based',
-                            'payload': payload,
-                            'category': category,
-                            'content_difference': content_diff,
-                            'confidence': 0.7,
-                            'details': f"Significant response size difference detected: {content_diff} bytes"
-                        })
-
-                    test_results[category].append({
-                        'payload': payload,
-                        'response_time': response_time,
-                        'status_code': response.status_code,
-                        'response_length': len(response.text),
-                        'content_difference': content_diff,
-                        'patterns_found': db_patterns
+                if err_payloads:
+                    vulnerabilities.append({
+                        'type': 'error_based',
+                        'parameter': param,
+                        'databases': sorted(err_dbs),
+                        'confirmed_payloads': err_payloads,
+                        'confirmations': len(err_payloads),
+                        'confidence': 0.9,
+                        'details': (f"Parametro '{param}' vulnerabile a SQL injection error-based "
+                                    f"({len(err_payloads)} payload hanno prodotto un errore DB assente nella baseline)."),
                     })
-                
-                except Exception as e:
-                    self._log_error(f"Error testing payload {payload}: {str(e)}")
-                    continue
-            
-                self._print_progress(index, total_tests)
-
-        unique_vulns = self._deduplicate_vulnerabilities(vulnerabilities)
+                if time_payloads:
+                    vulnerabilities.append({
+                        'type': 'time_based',
+                        'parameter': param,
+                        'confirmed_payloads': time_payloads,
+                        'confirmations': len(time_payloads),
+                        'confidence': 0.8,
+                        'details': (f"Parametro '{param}' possibile SQL injection time-based "
+                                    f"(risposta lenta e riconfermata su {len(time_payloads)} payload)."),
+                    })
 
         return {
             'url_tested': url,
+            'parameters_tested': target_params,
             'total_tests': total_tests,
-            'vulnerabilities_found': len(unique_vulns),
+            'vulnerabilities_found': len(vulnerabilities),
             'error_messages': list(error_messages),
-            'results_by_category': dict(test_results),
-            'vulnerabilities': unique_vulns,
-            'recommendations': self._generate_sql_recommendations(unique_vulns)
+            'vulnerabilities': vulnerabilities,
+            'recommendations': self._generate_sql_recommendations(vulnerabilities),
         }
-    
+
     def _detect_sql_vulnerabilities(self, response_text: str, payload: str) -> bool:
         """Analizza i pattern di errore per SQL Injection"""
         sql_errors = [
@@ -4141,118 +4149,89 @@ class WebSecurityTester(BaseModule):
         return False
 
     def test_xss(self, url: str, params: Optional[Dict] = None,
-                method: str = 'GET', data: Optional[Dict] = None,
-                custom_payloads: Optional[List[str]] = None) -> Dict:
+                 method: str = 'GET', data: Optional[Dict] = None,
+                 custom_payloads: Optional[List[str]] = None) -> Dict:
+        """Test XSS riflesso affidabile e per-parametro.
+
+        Regole per evitare falsi positivi e conteggi gonfiati:
+        - inietta UN parametro alla volta;
+        - segnala solo se il payload torna RIFLESSO NON CODIFICATO (i caratteri
+          '<' '>' sopravvivono grezzi: se l'app fa escaping in &lt;/&gt; il
+          payload non è eseguibile e NON viene segnalato);
+        - una sola voce per parametro vulnerabile, con l'elenco dei payload
+          eseguibili confermati. Nessun conteggio per-parola-chiave.
         """
-        Esegue test approfonditi di XSS
-        
-        Args:
-            url: URL da testare
-            params: Parametri GET opzionali
-            method: Metodo HTTP (GET/POST)
-            data: Dati POST opzionali
-            custom_payloads: Payload personalizzati aggiuntivi
-            
-        Returns:
-            Dict con risultati dei test e vulnerabilità trovate
-        """
-        vulnerabilities = []
-        test_results = defaultdict(list)
-        reflected_content = set()
-        
-        # Log inizio test
+        if not url.startswith(('http://', 'https://')):
+            raise ValueError("URL must start with http:// or https://")
+
+        target = urlparse(url).netloc
+        if self._is_rate_limited(target):
+            raise RateLimitExceeded(f"Rate limit exceeded for {target}")
+
         self._log_info(f"Iniziando test XSS su {url}")
-        print(f"\nTest XSS in corso su {url}")
-        print("Questo test può richiedere alcuni minuti...")
-        
-        # Unisci tutti i payload da testare
+
+        base_params = dict(params or {})
+        base_data = dict(data or {})
+        inject_map = base_params if method.upper() == 'GET' else base_data
+        target_params = list(inject_map.keys()) or ['q']
+
         all_payloads = []
         for category, payloads in self.xss_payloads.items():
-            all_payloads.extend([(payload, category) for payload in payloads])
+            all_payloads.extend([(p, category) for p in payloads])
         if custom_payloads:
-            all_payloads.extend([(payload, 'custom') for payload in custom_payloads])
-        
-        total_tests = len(all_payloads)
-        
-        for index, (payload, category) in enumerate(all_payloads, 1):
-            try:
-                # Mostra progresso
-                progress = (index / total_tests) * 100
-                print(f"\rProgresso: [{index}/{total_tests}] {progress:.1f}%", end='')
-                
-                # Prepara la richiesta
-                test_params = {k: v for k, v in (params or {}).items()}
-                test_data = {k: v for k, v in (data or {}).items()}
-                
-                # Inietta il payload
-                if method.upper() == 'GET':
-                    test_params['q'] = payload
-                else:
-                    test_data['q'] = payload
-                
-                # Esegui la richiesta in modo sicuro con SafeRequestHandler
-                response = self.request_handler.request(
-                    method=method.upper(),
-                    url=url,
-                    params=test_params,
-                    data=test_data,
-                    headers=self.headers,
-                    allow_redirects=True,
-                    verify=self.verify_ssl
-                )   
+            all_payloads.extend([(p, 'custom') for p in custom_payloads])
+        total_tests = 0
 
-                
-                # Analizza la risposta
-                response_text = response.text
-                
-                # Cerca payload riflesso
-                if payload.lower() in response_text.lower():
-                    reflected_content.add(payload)
+        def executable_reflection(payload: str, body: str) -> bool:
+            # Il payload deve comparire grezzo (con i suoi '<'/'>') nella risposta.
+            # Se l'app lo codifica in entità HTML, la sottostringa grezza non c'è.
+            if payload not in body:
+                return False
+            # Richiede almeno un carattere di rottura del contesto HTML non codificato.
+            return ('<' in payload and '<' in body) or bool(re.search(r'\son\w+=', payload))
+
+        vulnerabilities = []
+        with requests.Session() as session:
+            session.headers.update(self.headers)
+            session.verify = self.verify_ssl
+
+            for param in target_params:
+                confirmed = []
+                for payload, category in all_payloads:
+                    total_tests += 1
+                    req_params = dict(base_params)
+                    req_data = dict(base_data)
+                    (req_params if method.upper() == 'GET' else req_data)[param] = payload
+                    try:
+                        r = session.request(method=method.upper(), url=url,
+                                            params=req_params if method.upper() == 'GET' else None,
+                                            data=req_data if method.upper() != 'GET' else None,
+                                            timeout=self.timeout, allow_redirects=True)
+                    except requests.RequestException as e:
+                        self._log_warning(f"{param} payload '{payload}': {e}")
+                        continue
+                    if executable_reflection(payload, r.text):
+                        confirmed.append({'payload': payload, 'category': category})
+
+                if confirmed:
                     vulnerabilities.append({
                         'type': 'reflected',
-                        'payload': payload,
-                        'category': category,
-                        'details': "Payload riflesso nella risposta"
-                    })
-                
-                # Cerca pattern specifici XSS
-                for pattern in self.error_patterns['xss']:
-                  if pattern in response_text.lower():
-                     vulnerabilities.append({
-                          'type': 'pattern_match',
-                           'payload': payload,
-                            'category': category,
-                            'pattern': pattern,
-                            'details': f"Pattern XSS '{pattern}' trovato nella risposta"
+                        'parameter': param,
+                        'confirmed_payloads': [c['payload'] for c in confirmed],
+                        'confirmations': len(confirmed),
+                        'confidence': 0.9,
+                        'details': (f"Parametro '{param}' vulnerabile a XSS riflesso: "
+                                    f"{len(confirmed)} payload tornano non codificati ed eseguibili."),
                     })
 
-                # Salva risultati per categoria
-                test_results[category].append({
-                    'payload': payload,
-                    'response_time': response.elapsed.total_seconds(),
-                    'status_code': response.status_code,
-                    'response_length': len(response.text),
-                    'payload_reflected': payload.lower() in response_text.lower()
-                })
-                
-            except Exception as e:
-                self._log_error(f"Errore durante test con payload {payload}: {str(e)}")
-                continue
-        
-        print("\nAnalisi risultati in corso...")
-        
-        # Analisi risultati
-        analysis = {
+        return {
             'url_tested': url,
+            'parameters_tested': target_params,
             'total_tests': total_tests,
             'vulnerabilities_found': len(vulnerabilities),
-            'reflected_content': list(reflected_content),
-            'results_by_category': dict(test_results),
             'vulnerabilities': vulnerabilities,
-            'recommendations': self._generate_xss_recommendations(vulnerabilities)
+            'recommendations': self._generate_xss_recommendations(vulnerabilities),
         }
-        
-        return analysis
 
     def _generate_sql_recommendations(self, vulnerabilities: List[Dict]) -> List[str]:
         """Genera raccomandazioni basate sulle vulnerabilità SQL trovate"""
