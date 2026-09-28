@@ -4319,61 +4319,317 @@ class WebSecurityTester(BaseModule):
         
         return list(recommendations)
 
-    def scan_website(self, url: str, scan_depth: int = 1) -> Dict:
+    def _text_similarity(self, a: str, b: str) -> float:
+        """Somiglianza 0-1 tra due risposte (per il confronto boolean-blind)."""
+        import difflib
+        if not a or not b:
+            return 0.0
+        if len(a) > 20000:
+            a = a[:20000]
+        if len(b) > 20000:
+            b = b[:20000]
+        return difflib.SequenceMatcher(None, a, b).quick_ratio()
+
+    def test_boolean_blind_sql(self, url: str, params: Optional[Dict] = None,
+                               method: str = 'GET', data: Optional[Dict] = None) -> Dict:
+        """SQL injection blind booleana, per-parametro e differenziale.
+
+        Per ogni parametro invia una condizione VERA e una FALSA. È vulnerabile
+        solo se la risposta alla condizione vera somiglia alla baseline mentre
+        quella falsa è nettamente diversa, e il pattern è confermato da almeno
+        due coppie di payload indipendenti (riduce i falsi positivi da pagine
+        dinamiche). Una sola voce per parametro.
         """
-        Esegue una scansione completa di sicurezza di un sito web
-        
-        Args:
-            url: URL del sito da scansionare
-            scan_depth: Profondità della scansione (livelli di link da seguire)
-            
-        Returns:
-            Dict con risultati completi della scansione
+        if not url.startswith(('http://', 'https://')):
+            raise ValueError("URL must start with http:// or https://")
+        target = urlparse(url).netloc
+        if self._is_rate_limited(target):
+            raise RateLimitExceeded(f"Rate limit exceeded for {target}")
+
+        base_params = dict(params or {})
+        base_data = dict(data or {})
+        inject_map = base_params if method.upper() == 'GET' else base_data
+        target_params = list(inject_map.keys())
+        pairs = [
+            ("' AND 1=1-- -", "' AND 1=2-- -"),
+            ("' AND '1'='1", "' AND '1'='2"),
+            (" AND 1=1", " AND 1=2"),
+        ]
+        SIM_TRUE, SIM_FALSE = 0.95, 0.90
+        vulnerabilities = []
+        total_tests = 0
+
+        if not target_params:
+            return {'url_tested': url, 'total_tests': 0,
+                    'vulnerabilities_found': 0, 'vulnerabilities': []}
+
+        sess = self.request_handler
+
+        def fetch(param, value):
+            p = dict(base_params)
+            d = dict(base_data)
+            (p if method.upper() == 'GET' else d)[param] = value
+            r = sess.request(method=method.upper(), url=url,
+                             params=p if method.upper() == 'GET' else None,
+                             data=d if method.upper() != 'GET' else None,
+                             headers=self.headers, timeout=self.timeout,
+                             verify=self.verify_ssl, allow_redirects=True)
+            return r.text
+
+        for param in target_params:
+            try:
+                baseline = fetch(param, str(base_params.get(param) or base_data.get(param) or "1"))
+            except requests.RequestException:
+                continue
+            confirming = 0
+            for true_p, false_p in pairs:
+                total_tests += 2
+                try:
+                    rt = fetch(param, (str(inject_map.get(param) or "1")) + true_p)
+                    rf = fetch(param, (str(inject_map.get(param) or "1")) + false_p)
+                except requests.RequestException:
+                    continue
+                sim_true = self._text_similarity(baseline, rt)
+                sim_false = self._text_similarity(baseline, rf)
+                if sim_true >= SIM_TRUE and sim_false < SIM_FALSE and self._text_similarity(rt, rf) < SIM_FALSE:
+                    confirming += 1
+            if confirming >= 2:
+                vulnerabilities.append({
+                    'type': 'boolean_blind',
+                    'parameter': param,
+                    'confirmations': confirming,
+                    'confidence': 0.85,
+                    'details': (f"Parametro '{param}' vulnerabile a SQL injection blind booleana: "
+                                f"la condizione vera riproduce la pagina base, la falsa la altera "
+                                f"({confirming} coppie di payload concordi)."),
+                })
+
+        return {'url_tested': url, 'parameters_tested': target_params,
+                'total_tests': total_tests, 'vulnerabilities_found': len(vulnerabilities),
+                'vulnerabilities': vulnerabilities,
+                'recommendations': self._generate_sql_recommendations(vulnerabilities)}
+
+    def detect_dom_xss(self, url: str) -> Dict:
+        """DOM-based XSS: analisi statica di sorgenti controllate dall'utente che
+        raggiungono sink pericolosi negli script (inline e same-origin esterni).
+
+        Non esegue JavaScript: segnala potenziali flussi sorgente->sink (es.
+        location.hash -> document.write / innerHTML / eval). Confidenza media.
         """
-        print(f"\nInizio scansione sicurezza per {url}")
-        print(f"Profondità scansione: {scan_depth}")
-        
-        results = {
-            'url': url,
-            'scan_start': datetime.now().isoformat(),
-            'sql_injection': None,
-            'xss': None,
-            'summary': None
-        }
-        
+        import re as _re
+        from urllib.parse import urljoin
+        sess = self.request_handler
         try:
-            # Test SQL Injection
-            print("\nEsecuzione test SQL Injection...")
-            sql_results = self.test_sql_injection(url)
-            results['sql_injection'] = sql_results
-            
-            # Test XSS
-            print("\nEsecuzione test XSS...")
-            xss_results = self.test_xss(url)
-            results['xss'] = xss_results
-            
-            # Genera sommario
-            total_vulnerabilities = (
-                len(sql_results['vulnerabilities']) +
-                len(xss_results['vulnerabilities'])
-            )
-            
-            results['summary'] = {
-                'total_vulnerabilities': total_vulnerabilities,
-                'sql_injection_found': len(sql_results['vulnerabilities']),
-                'xss_found': len(xss_results['vulnerabilities']),
-                'risk_level': self._calculate_risk_level(total_vulnerabilities),
-                'scan_duration': str(datetime.now() - datetime.fromisoformat(results['scan_start']))
-            }
-            
-        except Exception as e:
-            self._log_error(f"Errore durante la scansione: {str(e)}")
-            results['error'] = str(e)
-            
-        finally:
-            results['scan_end'] = datetime.now().isoformat()
-            
-        return results
+            page = sess.get(url, headers=self.headers, timeout=self.timeout,
+                            verify=self.verify_ssl).text
+        except requests.RequestException as e:
+            return {'url_tested': url, 'error': str(e), 'vulnerabilities': [], 'vulnerabilities_found': 0}
+
+        scripts = _re.findall(r'<script[^>]*>(.*?)</script>', page, _re.IGNORECASE | _re.DOTALL)
+        base_netloc = urlparse(url).netloc
+        for src in _re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', page, _re.IGNORECASE):
+            full = urljoin(url, src)
+            if urlparse(full).netloc == base_netloc:
+                try:
+                    scripts.append(sess.get(full, headers=self.headers, timeout=self.timeout,
+                                            verify=self.verify_ssl).text)
+                except requests.RequestException:
+                    pass
+
+        # {etichetta leggibile: regex}
+        sources = {'location.hash': r'location\.hash', 'location.search': r'location\.search',
+                   'location.href': r'location\.href', 'location': r'\blocation\b',
+                   'document.URL': r'document\.URL', 'document.documentURI': r'document\.documentURI',
+                   'document.referrer': r'document\.referrer', 'document.baseURI': r'document\.baseURI',
+                   'window.name': r'window\.name'}
+        sinks = {'document.write()': r'document\.write(?:ln)?\s*\(', 'innerHTML': r'\.innerHTML\s*=',
+                 'outerHTML': r'\.outerHTML\s*=', 'insertAdjacentHTML()': r'insertAdjacentHTML\s*\(',
+                 'eval()': r'\beval\s*\(', 'new Function()': r'\bnew\s+Function\s*\(',
+                 'setTimeout(string)': r'setTimeout\s*\(\s*["\']',
+                 'setInterval(string)': r'setInterval\s*\(\s*["\']', 'jQuery.html()': r'\.html\s*\('}
+        vulnerabilities = []
+        for code in scripts:
+            found_sources = sorted({label for label, rx in sources.items() if _re.search(rx, code)})
+            found_sinks = sorted({label for label, rx in sinks.items() if _re.search(rx, code)})
+            if found_sources and found_sinks:
+                vulnerabilities.append({
+                    'type': 'dom_xss',
+                    'confidence': 0.6,
+                    'sources': found_sources,
+                    'sinks': found_sinks,
+                    'details': ("Potenziale DOM XSS: una sorgente controllabile dall'utente e un sink "
+                                "pericoloso nello stesso script (verifica manuale del flusso consigliata)."),
+                })
+        # una voce per combinazione unica sorgenti/sink
+        uniq = {}
+        for v in vulnerabilities:
+            uniq[(tuple(v['sources']), tuple(v['sinks']))] = v
+        vulnerabilities = list(uniq.values())
+        return {'url_tested': url, 'vulnerabilities_found': len(vulnerabilities),
+                'vulnerabilities': vulnerabilities}
+
+    def crawl(self, base_url: str, max_pages: int = 20, max_depth: int = 2) -> Dict:
+        """Crawler same-domain: scopre pagine, link con parametri GET e form.
+
+        Ritorna {'pages': [...], 'endpoints': [{url, method, params}]}.
+        Resta sullo stesso host, con limiti di pagine e profondità.
+        """
+        from urllib.parse import urljoin, urldefrag, parse_qs
+        from html.parser import HTMLParser
+
+        base_netloc = urlparse(base_url).netloc
+        sess = self.request_handler
+
+        class LinkForm(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.links = []
+                self.forms = []
+                self._cur = None
+
+            def handle_starttag(self, tag, attrs):
+                a = dict(attrs)
+                if tag == 'a' and a.get('href'):
+                    self.links.append(a['href'])
+                elif tag == 'form':
+                    self._cur = {'action': a.get('action', ''),
+                                 'method': (a.get('method') or 'GET').upper(),
+                                 'inputs': []}
+                elif tag in ('input', 'textarea', 'select') and self._cur is not None:
+                    if a.get('name'):
+                        self._cur['inputs'].append(a['name'])
+
+            def handle_endtag(self, tag):
+                if tag == 'form' and self._cur is not None:
+                    self.forms.append(self._cur)
+                    self._cur = None
+
+        seen_pages = set()
+        endpoints = {}
+        queue = [(base_url, 0)]
+        pages = []
+
+        while queue and len(seen_pages) < max_pages:
+            current, depth = queue.pop(0)
+            current, _ = urldefrag(current)
+            if current in seen_pages or urlparse(current).netloc != base_netloc:
+                continue
+            try:
+                r = sess.get(current, headers=self.headers, timeout=self.timeout,
+                             verify=self.verify_ssl, allow_redirects=True)
+            except requests.RequestException:
+                continue
+            seen_pages.add(current)
+            ctype = r.headers.get('Content-Type', '')
+            if 'html' not in ctype.lower():
+                continue
+            pages.append(current)
+
+            # endpoint dai parametri GET dell'URL stesso
+            qs = parse_qs(urlparse(current).query)
+            if qs:
+                key = (current.split('?')[0], 'GET', tuple(sorted(qs)))
+                endpoints[key] = {'url': current.split('?')[0], 'method': 'GET',
+                                  'params': {k: (v[0] if v else '1') for k, v in qs.items()}}
+
+            p = LinkForm()
+            try:
+                p.feed(r.text)
+            except Exception:
+                pass
+
+            for form in p.forms:
+                action = urljoin(current, form['action'] or current)
+                if urlparse(action).netloc != base_netloc or not form['inputs']:
+                    continue
+                key = (action, form['method'], tuple(sorted(form['inputs'])))
+                endpoints[key] = {'url': action, 'method': form['method'],
+                                  'params': {name: 'test' for name in form['inputs']}}
+
+            if depth < max_depth:
+                for href in p.links:
+                    nxt = urljoin(current, href)
+                    nxt, _ = urldefrag(nxt)
+                    if urlparse(nxt).netloc == base_netloc and nxt not in seen_pages:
+                        queue.append((nxt, depth + 1))
+
+        return {'pages': pages, 'endpoints': list(endpoints.values())}
+
+    def full_scan(self, url: str, max_pages: int = 20, max_depth: int = 2) -> Dict:
+        """Scansione completa: crawling + SQLi (error/time/blind boolean) + XSS
+        riflesso su ogni endpoint con parametri, e DOM XSS su ogni pagina."""
+        print(f"\nScansione completa di {url} (max {max_pages} pagine, profondità {max_depth})")
+        started = datetime.now()
+        crawl = self.crawl(url, max_pages=max_pages, max_depth=max_depth)
+        endpoints = crawl['endpoints']
+        pages = crawl['pages']
+        # assicura che almeno l'URL iniziale sia analizzato
+        if not any(e['url'] == url.split('?')[0] for e in endpoints):
+            from urllib.parse import parse_qs as _pq
+            qs = _pq(urlparse(url).query)
+            if qs:
+                endpoints.append({'url': url.split('?')[0], 'method': 'GET',
+                                  'params': {k: (v[0] if v else '1') for k, v in qs.items()}})
+        if url not in pages:
+            pages.insert(0, url)
+
+        findings = []
+        print(f"Trovate {len(pages)} pagine, {len(endpoints)} endpoint con parametri.")
+
+        for ep in endpoints:
+            u, mth, prm = ep['url'], ep['method'], ep['params']
+            try:
+                sql = self.test_sql_injection(u, params=prm if mth == 'GET' else None,
+                                              method=mth, data=prm if mth != 'GET' else None)
+                for v in sql.get('vulnerabilities', []):
+                    findings.append({**v, 'endpoint': u})
+            except Exception as e:
+                self._log_error(f"SQLi {u}: {e}")
+            try:
+                bb = self.test_boolean_blind_sql(u, params=prm if mth == 'GET' else None,
+                                                 method=mth, data=prm if mth != 'GET' else None)
+                for v in bb.get('vulnerabilities', []):
+                    findings.append({**v, 'endpoint': u})
+            except Exception as e:
+                self._log_error(f"blind {u}: {e}")
+            try:
+                xss = self.test_xss(u, params=prm if mth == 'GET' else None,
+                                    method=mth, data=prm if mth != 'GET' else None)
+                for v in xss.get('vulnerabilities', []):
+                    findings.append({**v, 'endpoint': u})
+            except Exception as e:
+                self._log_error(f"XSS {u}: {e}")
+
+        for page in pages:
+            try:
+                dom = self.detect_dom_xss(page)
+                for v in dom.get('vulnerabilities', []):
+                    findings.append({**v, 'endpoint': page})
+            except Exception as e:
+                self._log_error(f"DOM {page}: {e}")
+
+        by_type = {}
+        for f in findings:
+            by_type[f['type']] = by_type.get(f['type'], 0) + 1
+
+        return {
+            'url': url,
+            'scan_start': started.isoformat(),
+            'scan_end': datetime.now().isoformat(),
+            'scan_duration': str(datetime.now() - started),
+            'pages_crawled': len(pages),
+            'endpoints_tested': len(endpoints),
+            'vulnerabilities': findings,
+            'summary': {
+                'total_vulnerabilities': len(findings),
+                'by_type': by_type,
+                'risk_level': self._calculate_risk_level(len(findings)),
+            },
+        }
+
+    def scan_website(self, url: str, scan_depth: int = 1) -> Dict:
+        """Alias di compatibilità: esegue una scansione completa con crawling."""
+        return self.full_scan(url, max_pages=20, max_depth=max(1, scan_depth))
 
     def _calculate_risk_level(self, total_vulnerabilities: int) -> str:
         """Calcola il livello di rischio basato sul numero di vulnerabilità"""
@@ -4387,73 +4643,40 @@ class WebSecurityTester(BaseModule):
             return "Critico"
 
     def generate_report(self, scan_results: Dict) -> str:
-        """
-        Genera un report dettagliato dei risultati della scansione
-        
-        Args:
-            scan_results: Risultati della scansione
-            
-        Returns:
-            str: Report formattato
-        """
-        report = []
-        
-        # Intestazione
-        report.append("=" * 50)
-        report.append("REPORT SCANSIONE SICUREZZA WEB")
-        report.append("=" * 50)
-        report.append(f"\nURL Scansionato: {scan_results['url']}")
-        report.append(f"Data Inizio: {scan_results['scan_start']}")
-        report.append(f"Data Fine: {scan_results['scan_end']}")
-        
+        """Genera un report testuale dai risultati di full_scan/scan_website."""
+        r = ["=" * 50, "REPORT SCANSIONE SICUREZZA WEB", "=" * 50]
+        r.append(f"\nURL: {scan_results.get('url')}")
+        r.append(f"Inizio: {scan_results.get('scan_start')}   Fine: {scan_results.get('scan_end')}")
         if 'error' in scan_results:
-            report.append(f"\nERRORE DURANTE LA SCANSIONE: {scan_results['error']}")
-            return "\n".join(report)
-        
-        # Sommario
-        summary = scan_results['summary']
-        report.append("\nSOMMARIO:")
-        report.append(f"Vulnerabilità Totali: {summary['total_vulnerabilities']}")
-        report.append(f"Livello di Rischio: {summary['risk_level']}")
-        report.append(f"Durata Scansione: {summary['scan_duration']}")
-        
-        # Dettagli SQL Injection
-        sql_results = scan_results['sql_injection']
-        report.append("\nRISULTATI SQL INJECTION:")
-        report.append(f"Test Eseguiti: {sql_results['total_tests']}")
-        report.append(f"Vulnerabilità Trovate: {sql_results['vulnerabilities_found']}")
-        
-        if sql_results['vulnerabilities']:
-            report.append("\nDettaglio Vulnerabilità SQL:")
-            for vuln in sql_results['vulnerabilities']:
-                report.append(f"- Tipo: {vuln['type']}")
-                report.append(f"  Payload: {vuln['payload']}")
-                report.append(f"  Dettagli: {vuln['details']}")
-        
-        # Dettagli XSS
-        xss_results = scan_results['xss']
-        report.append("\nRISULTATI XSS:")
-        report.append(f"Test Eseguiti: {xss_results['total_tests']}")
-        report.append(f"Vulnerabilità Trovate: {xss_results['vulnerabilities_found']}")
-        
-        if xss_results['vulnerabilities']:
-            report.append("\nDettaglio Vulnerabilità XSS:")
-            for vuln in xss_results['vulnerabilities']:
-                report.append(f"- Tipo: {vuln['type']}")
-                report.append(f"  Payload: {vuln['payload']}")
-                report.append(f"  Dettagli: {vuln['details']}")
-        
-        # Raccomandazioni
-        report.append("\nRACCOMANDAZIONI SQL INJECTION:")
-        for rec in sql_results['recommendations']:
-            report.append(f"- {rec}")
-            
-        report.append("\nRACCOMANDAZIONI XSS:")
-        for rec in xss_results['recommendations']:
-            report.append(f"- {rec}")
-        
-        return "\n".join(report)
-    
+            r.append(f"\nERRORE: {scan_results['error']}")
+            return "\n".join(r)
+        summ = scan_results.get('summary', {})
+        r.append(f"Pagine analizzate: {scan_results.get('pages_crawled', '?')}   "
+                 f"Endpoint testati: {scan_results.get('endpoints_tested', '?')}")
+        r.append(f"Vulnerabilità totali: {summ.get('total_vulnerabilities', 0)}   "
+                 f"Rischio: {summ.get('risk_level', '-')}")
+        if summ.get('by_type'):
+            r.append("Per tipo: " + ", ".join(f"{k}={v}" for k, v in summ['by_type'].items()))
+        vulns = scan_results.get('vulnerabilities', [])
+        if vulns:
+            r.append("\nDETTAGLIO:")
+            for v in vulns:
+                loc = v.get('endpoint') or v.get('parameter') or ''
+                line = f"- [{v.get('type')}] {loc}"
+                if v.get('parameter'):
+                    line += f"  parametro={v['parameter']}"
+                if v.get('confirmations'):
+                    line += f"  conferme={v['confirmations']}"
+                if v.get('sinks'):
+                    line += f"  sink={','.join(v['sinks'])} sorgenti={','.join(v.get('sources', []))}"
+                r.append(line)
+                if v.get('details'):
+                    r.append(f"    {v['details']}")
+        else:
+            r.append("\nNessuna vulnerabilità confermata.")
+        return "\n".join(r)
+
+
 def web_security_menu():
     """Menu interattivo per i test di sicurezza web"""
     
@@ -4487,7 +4710,7 @@ def web_security_menu():
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 filename = f"scan_report_{timestamp}.txt"
                 
-                with open(filename, 'w') as f:
+                with open(filename, 'w', encoding='utf-8') as f:
                     f.write(tester.generate_report(results))
                     
                 print(f"\nScan completato. Report salvato in: {filename}")
@@ -4496,7 +4719,7 @@ def web_security_menu():
                 print("\nSommario Scansione:")
                 print(f"Vulnerabilità trovate: {results['summary']['total_vulnerabilities']}")
                 print(f"Livello di rischio: {results['summary']['risk_level']}")
-                print(f"Durata: {results['summary']['scan_duration']}")
+                print(f"Durata: {results.get('scan_duration', 'N/A')}")
                 
             except Exception as e:
                 print(f"\nErrore durante la scansione: {str(e)}")

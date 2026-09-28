@@ -10,17 +10,28 @@ Interactive Python CLI built as a learning project during the *Junior System and
 |---|---|
 | Password | Strength check against common patterns and a small leaked-password list, secure password generator (`secrets`) |
 | Network scanner | Async TCP port scan, banner grabbing, TLS certificate and HTTP header info, export to txt/json/html/csv |
-| Web security | Basic SQL injection and reflected XSS probes (heuristic, keyword based) |
+| Web security | Same-domain crawler, then per-parameter web tests: SQL injection (error-based, time-based, boolean-blind), reflected XSS and static DOM-based XSS detection; text report |
 | Network monitor | Active connections and per-process network activity via `psutil` |
+
+## How the web scanner works
+
+Run *Web Security Tests > Full site scan*: it crawls the same-domain pages, collects GET links and forms, then tests every parameter. Results are trustworthy, not inflated:
+
+- **One finding per vulnerable parameter** (with the count of confirming payloads), never one per payload or per keyword.
+- **SQLi error-based** is differential — a DB error counts only if it appears with the payload but not in the clean baseline request.
+- **SQLi time-based** requires a slow response reconfirmed by a second request (relative + absolute threshold).
+- **SQLi boolean-blind** compares a TRUE and a FALSE condition against the baseline and needs at least two independent payload pairs to agree.
+- **Reflected XSS** is flagged only when the payload is reflected **unescaped** (an app that HTML-encodes output is correctly not flagged).
+- **DOM-based XSS** is a static check: it reports a user-controlled source (e.g. `location.hash`) reaching a dangerous sink (e.g. `document.write()`, `innerHTML`, `eval()`) in the same script; it does not execute JavaScript, so treat it as a lead to verify by hand.
 
 ## Known limitations
 
 This is a learning project, not a professional scanner:
 
-- SQLi/XSS detection is **per-parameter and differential**: it injects one parameter at a time and reports one finding per vulnerable parameter (with the count of confirming payloads), not one per payload. Error-based SQLi is flagged only when a DB error appears with the payload but not in the clean baseline request; reflected XSS only when the payload is reflected **unescaped** (an app that HTML-encodes output is correctly not flagged). It still does not cover boolean-blind SQLi or DOM-based XSS and does not crawl — use OWASP ZAP, Burp Suite or sqlmap for real assessments.
-- Some scan modes (`fast`, `smart`, `adaptive`, `specific service`) return simulated placeholder data.
-- The file contains unused code paths that are being cleaned up.
-- No automated test suite yet (the detection was validated manually against controlled local apps and the authorized target scanme.nmap.org).
+- No boolean-blind data extraction, no UNION column discovery, no authenticated crawling, no JavaScript execution. For real engagements use OWASP ZAP, Burp Suite or sqlmap.
+- Some port-scan modes (`fast`, `smart`, `adaptive`, `specific service`) return simulated placeholder data.
+- The file still contains unused code paths that are being cleaned up.
+- No automated test suite yet: detection was validated manually against controlled local apps (vulnerable → found, HTML-escaping/static → nothing) and the port scanner against the authorized target scanme.nmap.org.
 
 ## Installation
 
@@ -39,11 +50,13 @@ python "Advanced Security Suite.py"
 
 ## Italiano
 
-CLI Python interattiva, progetto di studio del corso *Junior System and CyberSecurity Analyst* (Generation Italy). Riunisce analisi password, port scanner TCP, controlli web di base e monitoraggio di rete locale in un unico menu.
+CLI Python interattiva, progetto di studio del corso *Junior System and CyberSecurity Analyst* (Generation Italy). Riunisce analisi password, port scanner TCP, scanner web con crawling e monitoraggio di rete locale in un unico menu.
 
 > **Solo uso autorizzato.** Scansiona e testa solo sistemi tuoi o per cui hai un'autorizzazione scritta. La scansione non autorizzata può essere reato (es. art. 615-ter c.p.). L'autore non risponde di usi impropri.
 
-**Limiti noti:** rilevamento SQLi/XSS euristico (falsi positivi e negativi), alcune modalità di scansione restituiscono dati simulati, codice inutilizzato in fase di pulizia, nessun test automatico.
+**Scanner web** (*Web Security Tests > Scansione completa sito*): fa il crawling delle pagine dello stesso dominio, raccoglie link GET e form, poi testa ogni parametro. Risultati veri, non gonfiati: **una voce per parametro vulnerabile** (col numero di payload che l'hanno confermata). Copre SQL injection error-based (differenziale rispetto alla baseline), time-based (riconfermata), blind booleana (confronto condizione vera/falsa), XSS riflesso (solo se il payload torna **non codificato**) e DOM XSS statico (sorgente controllabile → sink pericoloso nello stesso script, da verificare a mano).
+
+**Limiti noti:** niente estrazione dati via blind booleana, niente scoperta colonne UNION, niente crawling autenticato, nessuna esecuzione di JavaScript. Alcune modalità di port scan restituiscono dati simulati, resta del codice inutilizzato da ripulire, nessun test automatico (rilevamento validato a mano su app locali controllate e port scanner su scanme.nmap.org). Per lavori professionali usa OWASP ZAP, Burp o sqlmap.
 
 **Installazione:** Python 3.10+, poi `pip install -r requirements.txt` e `python "Advanced Security Suite.py"`.
 
